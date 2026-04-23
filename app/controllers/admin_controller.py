@@ -293,6 +293,15 @@ def get_student(
     }
 
 
+@router.delete("/students/{student_id}")
+def delete_student(
+    student_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_admin_user),
+):
+    return admin_svc.delete_student(student_id, db)
+
+
 @router.patch("/students/{student_id}/toggle-active")
 def toggle_student_active(
     student_id: int,

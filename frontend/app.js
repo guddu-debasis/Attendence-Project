@@ -267,6 +267,7 @@ async function loadRoleData() {
 }
 
 async function loadAdminData() {
+  const selectedStudentId = state.admin.studentDetail?.id || null;
   const [branches, semesters, subjects, teachers, students] = await Promise.all([
     api("/api/admin/branches"),
     api("/api/admin/semesters"),
@@ -280,6 +281,9 @@ async function loadAdminData() {
   state.admin.subjects = subjects;
   state.admin.teachers = teachers;
   state.admin.students = students;
+  if (selectedStudentId && !students.some((student) => student.id === selectedStudentId)) {
+    state.admin.studentDetail = null;
+  }
 }
 
 async function refreshStudents() {
@@ -1260,7 +1264,8 @@ function renderStudentsTable() {
                 <div class="button-row">
                   <button type="button" class="tiny-btn ghost-btn" data-action="view-student" data-id="${student.id}">View</button>
                   <button type="button" class="tiny-btn secondary-btn" data-action="toggle-student" data-id="${student.id}">${student.is_active ? "Deactivate" : "Activate"}</button>
-                  <button type="button" class="tiny-btn danger-btn" data-action="reset-student-password" data-id="${student.id}">Reset Password</button>
+                  <button type="button" class="tiny-btn secondary-btn" data-action="reset-student-password" data-id="${student.id}">Reset Password</button>
+                  <button type="button" class="tiny-btn danger-btn" data-action="delete-student" data-id="${student.id}">Delete</button>
                 </div>
               </td>
             </tr>
@@ -1697,6 +1702,15 @@ function bindAdminEvents() {
       await refreshStudents();
       if (state.admin.studentDetail?.id === Number(id)) {
         state.admin.studentDetail = await api(`/api/admin/students/${id}`);
+      }
+    }),
+    "delete-student": (id) => deleteResource(`/api/admin/students/${id}`, "Student deleted.", async () => {
+      await loadAdminData();
+      if (state.admin.filters.branch_id || state.admin.filters.semester_id) {
+        await refreshStudents();
+      }
+      if (state.admin.studentDetail?.id === Number(id)) {
+        state.admin.studentDetail = null;
       }
     }),
     "reset-student-password": async (id) => {

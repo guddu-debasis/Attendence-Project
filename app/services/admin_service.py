@@ -1,7 +1,10 @@
+from sqlalchemy import or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 from fastapi import HTTPException, status
 
 from app.models.user import User, UserRole
+from app.models.attendance import Attendance
 from app.models.branch import Branch
 from app.models.semester import Semester
 from app.models.subject import Subject
@@ -17,6 +20,84 @@ from app.schemas.student import BulkImportResponse
 from app.utils.security import hash_password
 from app.utils.google_form_parser import parse_google_form_csv, parse_date
 
+
+
+def _describe_related_count(
+    count: int,
+    singular: str,
+    plural: str | None = None,
+) -> str:
+    label = singular if count == 1 else (plural or f"{singular}s")
+    return f"{count} {label}"
+
+
+def _raise_delete_conflict(
+    resource_label: str,
+    resource_name: str,
+    related_counts: list[tuple[int, str, str | None]],
+) -> None:
+    blockers = [
+        _describe_related_count(count, singular, plural)
+        for count, singular, plural in related_counts
+        if count
+    ]
+    if not blockers:
+        return
+
+    if len(blockers) == 1:
+        details = blockers[0]
+    else:
+        details = ", ".join(blockers[:-1]) + f" and {blockers[-1]}"
+
+    raise HTTPException(
+        status.HTTP_409_CONFLICT,
+        (
+            f"Cannot delete {resource_label} '{resource_name}' because it still has "
+            f"{details}. Remove or reassign those records first."
+        ),
+    )
+
+
+def _commit_with_delete_guard(db: Session, message: str) -> None:
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status.HTTP_409_CONFLICT, message) from None
+
+
+def _delete_attendance_for_students_or_subjects(
+    db: Session,
+    *,
+    student_ids: list[int] | None = None,
+    subject_ids: list[int] | None = None,
+) -> None:
+    student_ids = student_ids or []
+    subject_ids = subject_ids or []
+
+    filters = []
+    if student_ids:
+        filters.append(Attendance.student_id.in_(student_ids))
+    if subject_ids:
+        filters.append(Attendance.subject_id.in_(subject_ids))
+    if not filters:
+        return
+
+    condition = filters[0] if len(filters) == 1 else or_(*filters)
+    db.query(Attendance).filter(condition).delete(synchronize_session=False)
+
+
+def _delete_students_and_users(db: Session, student_ids: list[int]) -> None:
+    if not student_ids:
+        return
+
+    user_ids = [
+        user_id
+        for (user_id,) in db.query(Student.user_id).filter(Student.id.in_(student_ids)).all()
+    ]
+    db.query(Student).filter(Student.id.in_(student_ids)).delete(synchronize_session=False)
+    if user_ids:
+        db.query(User).filter(User.id.in_(user_ids)).delete(synchronize_session=False)
 
 
 def create_branch(payload: BranchCreate, db: Session) -> Branch:
@@ -53,8 +134,28 @@ def update_branch(branch_id: int, payload: BranchUpdate, db: Session) -> Branch:
 
 def delete_branch(branch_id: int, db: Session) -> dict:
     branch = get_branch(branch_id, db)
+    student_ids = [
+        student_id
+        for (student_id,) in db.query(Student.id).filter(Student.branch_id == branch_id).all()
+    ]
+    subject_ids = [
+        subject_id
+        for (subject_id,) in db.query(Subject.id).filter(Subject.branch_id == branch_id).all()
+    ]
+
+    _delete_attendance_for_students_or_subjects(
+        db,
+        student_ids=student_ids,
+        subject_ids=subject_ids,
+    )
+    _delete_students_and_users(db, student_ids)
+    if subject_ids:
+        db.query(Subject).filter(Subject.id.in_(subject_ids)).delete(synchronize_session=False)
     db.delete(branch)
-    db.commit()
+    _commit_with_delete_guard(
+        db,
+        f"Cannot delete branch '{branch.name}' because it is still referenced by other records.",
+    )
     return {"message": f"Branch '{branch.name}' deleted"}
 
 
@@ -89,8 +190,19 @@ def update_semester(sem_id: int, payload: SemesterUpdate, db: Session) -> Semest
 
 def delete_semester(sem_id: int, db: Session) -> dict:
     sem = get_semester(sem_id, db)
+    _raise_delete_conflict(
+        "semester",
+        sem.name,
+        [
+            (db.query(Student).filter(Student.semester_id == sem_id).count(), "student", None),
+            (db.query(Subject).filter(Subject.semester_id == sem_id).count(), "subject", None),
+        ],
+    )
     db.delete(sem)
-    db.commit()
+    _commit_with_delete_guard(
+        db,
+        f"Cannot delete semester '{sem.name}' because it is still referenced by other records.",
+    )
     return {"message": f"Semester '{sem.name}' deleted"}
 
 
@@ -146,8 +258,12 @@ def update_subject(subject_id: int, payload: SubjectUpdate, db: Session) -> Subj
 
 def delete_subject(subject_id: int, db: Session) -> dict:
     subject = get_subject(subject_id, db)
+    db.query(Attendance).filter(Attendance.subject_id == subject_id).delete(synchronize_session=False)
     db.delete(subject)
-    db.commit()
+    _commit_with_delete_guard(
+        db,
+        f"Cannot delete subject '{subject.name}' because it is still referenced by other records.",
+    )
     return {"message": f"Subject '{subject.name}' deleted"}
 
 
@@ -222,10 +338,32 @@ def update_teacher(teacher_id: int, payload: TeacherUpdate, db: Session) -> Teac
 
 def delete_teacher(teacher_id: int, db: Session) -> dict:
     teacher = get_teacher(teacher_id, db)
+    _raise_delete_conflict(
+        "teacher",
+        teacher.name,
+        [
+            (
+                db.query(Attendance).filter(Attendance.marked_by_id == teacher_id).count(),
+                "attendance record",
+                "attendance records",
+            ),
+        ],
+    )
+
+    db.query(Subject).filter(Subject.teacher_id == teacher_id).update(
+        {Subject.teacher_id: None},
+        synchronize_session=False,
+    )
     user = teacher.user
     db.delete(teacher)
     db.delete(user)
-    db.commit()
+    _commit_with_delete_guard(
+        db,
+        (
+            f"Cannot delete teacher '{teacher.name}' because the account is still "
+            "referenced by other records."
+        ),
+    )
     return {"message": f"Teacher '{teacher.name}' and their account deleted"}
 
 
@@ -347,6 +485,19 @@ def get_student(student_id: int, db: Session) -> Student:
     if not s:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
     return s
+
+
+def delete_student(student_id: int, db: Session) -> dict:
+    student = get_student(student_id, db)
+    user = student.user
+    db.query(Attendance).filter(Attendance.student_id == student_id).delete(synchronize_session=False)
+    db.delete(student)
+    db.delete(user)
+    _commit_with_delete_guard(
+        db,
+        f"Cannot delete student '{student.name}' because it is still referenced by other records.",
+    )
+    return {"message": f"Student '{student.name}' and their account deleted"}
 
 
 def toggle_student_active(student_id: int, db: Session) -> dict:
