@@ -1,4 +1,7 @@
-from datetime import date
+import csv
+import re
+from datetime import date, datetime
+from io import StringIO
 from sqlalchemy.orm import Session
 from fastapi import HTTPException, status
 
@@ -32,6 +35,12 @@ def _authorize_subject(teacher: Teacher, subject_id: int, db: Session) -> Subjec
             "You are not assigned to this subject",
         )
     return subject
+
+
+def _build_report_filename(subject: Subject) -> str:
+    raw_name = f"{subject.code}_class_attendance_report.csv"
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_name).strip("._")
+    return sanitized or "attendance_report.csv"
 
 
 
@@ -214,3 +223,76 @@ def get_students_for_subject(
         {"id": s.id, "name": s.name, "roll_no": s.roll_no}
         for s in students
     ]
+
+
+def export_class_attendance_report(
+    subject_id: int,
+    current_user_id: int,
+    db: Session,
+) -> tuple[str, str]:
+    teacher = _get_teacher_by_user(current_user_id, db)
+    subject = _authorize_subject(teacher, subject_id, db)
+
+    students = (
+        db.query(Student)
+        .filter(
+            Student.branch_id == subject.branch_id,
+            Student.semester_id == subject.semester_id,
+        )
+        .order_by(Student.roll_no)
+        .all()
+    )
+
+    records = (
+        db.query(Attendance)
+        .filter(Attendance.subject_id == subject.id)
+        .order_by(Attendance.date.asc())
+        .all()
+    )
+
+    total_classes = len({record.date for record in records})
+    records_by_student: dict[int, list[Attendance]] = {}
+    for record in records:
+        records_by_student.setdefault(record.student_id, []).append(record)
+
+    output = StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Student Name",
+        "Roll No",
+        "Subject",
+        "Subject Code",
+        "Teacher",
+        "Branch",
+        "Semester",
+        "Classes Attended",
+        "Total Classes Held",
+        "Classes Missed",
+        "Attendance Percentage",
+        "Report Generated At",
+    ])
+
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    branch_name = subject.branch.name if subject.branch else ""
+    semester_name = subject.semester.name if subject.semester else ""
+    for student in students:
+        student_records = records_by_student.get(student.id, [])
+        present = sum(1 for record in student_records if record.status == AttendanceStatus.present)
+        missed = max(total_classes - present, 0)
+        percentage = round((present / total_classes) * 100, 2) if total_classes else 0.0
+        writer.writerow([
+            student.name,
+            student.roll_no,
+            subject.name,
+            subject.code,
+            teacher.name,
+            branch_name,
+            semester_name,
+            present,
+            total_classes,
+            missed,
+            percentage,
+            generated_at,
+        ])
+
+    return "\ufeff" + output.getvalue(), _build_report_filename(subject)

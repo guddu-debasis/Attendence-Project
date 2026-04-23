@@ -2,16 +2,8 @@ const STORAGE_KEY = "attendance-command-center";
 const DEFAULT_API_BASE =
   window.ATTENDANCE_CONFIG?.apiBase?.replace(/\/$/, "") || "http://localhost:8000";
 
-const state = {
-  apiBase: DEFAULT_API_BASE,
-  token: "",
-  role: "",
-  userId: null,
-  me: null,
-  activeTab: "overview",
-  loading: false,
-  loginRole: "admin",
-  admin: {
+function createAdminState() {
+  return {
     branches: [],
     semesters: [],
     subjects: [],
@@ -25,21 +17,41 @@ const state = {
       subjectId: null,
       teacherId: null,
     },
-  },
-  teacher: {
+  };
+}
+
+function createTeacherState() {
+  return {
     subjects: [],
     selectedSubjectId: "",
     selectedDate: new Date().toISOString().slice(0, 10),
     students: [],
     dates: [],
     records: [],
-  },
-  student: {
+  };
+}
+
+function createStudentState() {
+  return {
     profile: null,
     summary: [],
     detailSubjectId: "",
     detail: [],
-  },
+  };
+}
+
+const state = {
+  apiBase: DEFAULT_API_BASE,
+  token: "",
+  role: "",
+  userId: null,
+  me: null,
+  activeTab: "overview",
+  loading: false,
+  loginRole: "admin",
+  admin: createAdminState(),
+  teacher: createTeacherState(),
+  student: createStudentState(),
 };
 
 const app = document.getElementById("app");
@@ -77,6 +89,9 @@ function clearSession() {
   state.userId = null;
   state.me = null;
   state.activeTab = "overview";
+  state.admin = createAdminState();
+  state.teacher = createTeacherState();
+  state.student = createStudentState();
   localStorage.removeItem(STORAGE_KEY);
 }
 
@@ -168,6 +183,37 @@ function safeJson(text) {
   } catch (_) {
     return text;
   }
+}
+
+async function downloadApiFile(path, fallbackFilename = "download.csv") {
+  const headers = new Headers();
+  if (state.token) {
+    headers.set("Authorization", `Bearer ${state.token}`);
+  }
+
+  const response = await fetch(`${state.apiBase}${path}`, { headers });
+  if (!response.ok) {
+    const text = await response.text();
+    const data = text ? safeJson(text) : null;
+    const detail = data?.detail || data?.message || text || `Request failed with ${response.status}`;
+    throw new Error(detail);
+  }
+
+  const blob = await response.blob();
+  const contentDisposition = response.headers.get("Content-Disposition") || "";
+  const filenameMatch = contentDisposition.match(/filename\*?=(?:UTF-8''|")?([^\";]+)/i);
+  const filename = filenameMatch
+    ? decodeURIComponent(filenameMatch[1].replace(/"/g, "").trim())
+    : fallbackFilename;
+
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 function setLoading(flag) {
@@ -296,12 +342,24 @@ async function refreshStudents() {
 
 async function loadTeacherData() {
   state.teacher.subjects = await api("/api/teacher/subjects");
-  if (!state.teacher.selectedSubjectId && state.teacher.subjects.length) {
-    state.teacher.selectedSubjectId = String(state.teacher.subjects[0].id);
+  const hasSelectedSubject = state.teacher.subjects.some(
+    (subject) => String(subject.id) === String(state.teacher.selectedSubjectId),
+  );
+
+  if (!hasSelectedSubject) {
+    state.teacher.selectedSubjectId = state.teacher.subjects.length
+      ? String(state.teacher.subjects[0].id)
+      : "";
   }
-  if (state.teacher.selectedSubjectId) {
-    await loadTeacherSubjectData(state.teacher.selectedSubjectId, state.teacher.selectedDate);
+
+  if (!state.teacher.selectedSubjectId) {
+    state.teacher.students = [];
+    state.teacher.dates = [];
+    state.teacher.records = [];
+    return;
   }
+
+  await loadTeacherSubjectData(state.teacher.selectedSubjectId, state.teacher.selectedDate);
 }
 
 async function loadTeacherSubjectData(subjectId, date) {
@@ -1020,6 +1078,15 @@ function renderTeacher() {
           ${renderTeacherRecords()}
         </div>
       </section>
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 class="section-title">Class Attendance Report</h2>
+            <p class="section-copy">Download one CSV with every student's attendance summary for the selected subject.</p>
+          </div>
+        </div>
+        ${renderTeacherClassReportCard()}
+      </section>
     `,
   };
 
@@ -1391,6 +1458,39 @@ function renderTeacherRecords() {
         </tbody>
       </table>
     </div>
+  `;
+}
+
+function renderTeacherClassReportCard() {
+  if (!state.teacher.selectedSubjectId) {
+    return `<div class="empty-state">Choose a subject first to download the class attendance report.</div>`;
+  }
+  if (!state.teacher.students.length) {
+    return `<div class="empty-state">No students are available for the selected subject yet.</div>`;
+  }
+
+  const subject = state.teacher.subjects.find((item) => String(item.id) === String(state.teacher.selectedSubjectId));
+  return `
+    <div class="summary-grid">
+      <div class="subject-card">
+        <span>Subject</span>
+        <strong>${escapeHtml(subject?.name || "Selected subject")}</strong>
+      </div>
+      <div class="subject-card">
+        <span>Students</span>
+        <strong>${state.teacher.students.length}</strong>
+      </div>
+      <div class="subject-card">
+        <span>Recorded Dates</span>
+        <strong>${state.teacher.dates.length}</strong>
+      </div>
+    </div>
+    <div class="button-row">
+      <button data-action="download-class-report">Download CSV Report</button>
+    </div>
+    <p class="panel-note">
+      The report includes each student's classes attended, total classes held, classes missed, and attendance percentage for this subject.
+    </p>
   `;
 }
 
@@ -1818,6 +1918,17 @@ function bindTeacherEvents() {
       await runSafely(async () => {
         await loadTeacherSubjectData(id, state.teacher.selectedDate);
         render();
+      });
+    },
+    "download-class-report": async () => {
+      const subject = state.teacher.subjects.find((item) => String(item.id) === String(state.teacher.selectedSubjectId));
+      const fallbackFilename = `${subject?.code || "subject"}_class_attendance_report.csv`;
+      await runSafely(async () => {
+        await downloadApiFile(
+          `/api/teacher/subjects/${state.teacher.selectedSubjectId}/attendance-report`,
+          fallbackFilename,
+        );
+        toast(`Class report downloaded for ${subject?.name || "the selected subject"}.`, "success");
       });
     },
     "update-record": async (id) => {

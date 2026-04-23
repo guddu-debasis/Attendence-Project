@@ -1,5 +1,6 @@
 from datetime import date
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -33,6 +34,24 @@ def students_for_subject(
 ):
     """Return students enrolled in the branch+semester of this subject."""
     return teacher_svc.get_students_for_subject(subject_id, current_user.id, db)
+
+
+@router.get("/subjects/{subject_id}/attendance-report")
+def download_class_attendance_report(
+    subject_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_teacher_user),
+):
+    csv_content, filename = teacher_svc.export_class_attendance_report(
+        subject_id,
+        current_user.id,
+        db,
+    )
+    return Response(
+        content=csv_content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/attendance", status_code=201)
