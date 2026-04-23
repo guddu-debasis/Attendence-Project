@@ -115,8 +115,8 @@ CREATE DATABASE attendance_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 
 ### 3. Clone & Install
 ```bash
-git clone https://github.com/your-username/sams.git
-cd attendance_system
+git clone https://github.com/guddu-debasis/Attendence-Project
+cd Attendence-Project
 python -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
